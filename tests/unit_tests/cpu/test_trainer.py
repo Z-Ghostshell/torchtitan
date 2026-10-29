@@ -1069,6 +1069,35 @@ def no_registered_aux_losses():
     AuxLoss._group_counts.update(saved_group_counts)
 
 
+def test_train_passes_failure_to_profiler_close() -> None:
+    failure = torch.OutOfMemoryError("test OOM")
+    engine = SimpleNamespace(
+        num_completed_steps=0,
+        load_checkpoint=MagicMock(),
+        start_profiler=MagicMock(),
+        close_profiler=MagicMock(),
+    )
+    trainer = cast(
+        Trainer,
+        SimpleNamespace(
+            config=SimpleNamespace(),
+            engine=engine,
+            dataloader=object(),
+            microbatch_generator=MagicMock(return_value=iter(())),
+            should_continue_training=MagicMock(return_value=True),
+            train_step=MagicMock(side_effect=failure),
+        ),
+    )
+
+    with pytest.raises(torch.OutOfMemoryError, match="test OOM"):
+        Trainer.train.__wrapped__(trainer)
+
+    exc_type, exc_val, exc_tb = engine.close_profiler.call_args.args
+    assert exc_type is torch.OutOfMemoryError
+    assert exc_val is failure
+    assert exc_tb is not None
+
+
 @pytest.mark.parametrize(
     ("loss_token_counts", "routing_token_counts"),
     (

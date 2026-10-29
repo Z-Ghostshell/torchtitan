@@ -34,6 +34,10 @@ _EXPORT_SUPPORTS_ANNOTATIONS = (
     "cuda_graph_annotations"
     in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
 )
+_EXPORT_SUPPORTS_GRAPH_LANES = (
+    "graph_lanes"
+    in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
+)
 
 # Paths expects by meta internal tooling
 PROFILE_DIR = "profiling/traces"  # Profiler.Config.save_traces_folder default
@@ -507,7 +511,20 @@ class Profiler(Configurable):
                         "annotations."
                     )
                     annotations = None
-                extra = {"cuda_graph_annotations": annotations} if annotations else {}
+                extra: dict[str, Any] = {}
+                if annotations:
+                    extra["cuda_graph_annotations"] = annotations
+                    if _EXPORT_SUPPORTS_GRAPH_LANES:
+                        # CUDA graph replay may place logically related work on
+                        # hundreds of executor streams. Render annotated work on
+                        # stable logical compute/comms lanes.
+                        extra["graph_lanes"] = "all"
+                    else:
+                        logger.warning(
+                            "This torch does not support graph_lanes on "
+                            "export_chrome_trace; CUDA graph replay work will remain "
+                            "scattered across its executor streams."
+                        )
                 prof.export_chrome_trace(output_file, **extra)
 
             logger.info(
