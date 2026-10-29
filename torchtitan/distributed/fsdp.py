@@ -284,6 +284,7 @@ def apply_fsdp_to_decoder(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    enable_explicit_backward_prefetch: bool = True,
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
@@ -316,6 +317,10 @@ def apply_fsdp_to_decoder(
               "smart defaults" for known optimal scenarios.
             - "always" enables ``reshard_after_forward`` for all forward passes.
             - "never" disables ``reshard_after_forward`` for all forward passes.
+        enable_explicit_backward_prefetch: Whether expert-parallel models
+            explicitly prefetch the preceding transformer block during
+            backward. Disabling this reduces peak unsharded-parameter memory
+            at the cost of communication overlap.
         ep_degree (int, optional): Expert-parallel degree. Defaults to 1 (no EP),
             in which case the MoE-specific sharding and prefetching are no-ops.
         edp_mesh (DeviceMesh | None, optional): The FSDP mesh for routed-expert
@@ -531,7 +536,20 @@ def apply_fsdp_to_decoder(
                 [model.norm, model.lm_head]
             )
 
-    # set up explicit prefetching when EP is enabled for backward
+    if not enable_explicit_backward_prefetch:
+        # An empty explicit target list enables FSDP's implicit fallback
+        # prefetch. Point each FSDP state at itself instead: the state is
+        # already unsharded when the hook runs, so this is a no-op that also
+        # suppresses the fallback and its extra live parameter unit.
+        for module in model.modules():
+            if callable(
+                set_backward_prefetch := getattr(
+                    module, "set_modules_to_backward_prefetch", None
+                )
+            ):
+                set_backward_prefetch([module])
+        return
+
     # pyrefly: ignore [no-matching-overload]
     reversed_transformer_blocks = list(reversed(model.layers.values()))
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
