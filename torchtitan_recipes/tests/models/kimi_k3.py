@@ -55,6 +55,7 @@ from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.trainer import Trainer
 
 from torchtitan_recipes.tests.models.kimi_k2_7 import (
+    _align_dist_muon_dense_fsdp_compute_layouts,
     _align_dist_muon_expert_compute_layouts,
     _per_expert_compute_layout,
 )
@@ -161,6 +162,7 @@ def _dist_muon_optimizer(
         shardings_by_mesh_axis={
             MeshAxisName.DP_SHARD.value: Owned(),
             f"{MeshAxisName.DP_SHARD.value}_{MeshAxisName.CP.value}": Owned(),
+            MeshAxisName.TP.value: Owned(),
         },
         compute_dtype=torch.bfloat16,
     )
@@ -173,6 +175,7 @@ def _dist_muon_optimizer(
                 f"{MeshAxisName.DP_SHARD.value}_{MeshAxisName.CP.value}": BlockShard(
                     dim=0, block_sizes=num_rows
                 ),
+                MeshAxisName.TP.value: BlockShard(dim=0, block_sizes=num_rows),
             },
             compute_dtype=torch.bfloat16,
         )
@@ -210,6 +213,7 @@ def _dist_muon_optimizer(
             shardings_by_mesh_axis={
                 MeshAxisName.DP_SHARD.value: Shard(0),
                 f"{MeshAxisName.DP_SHARD.value}_{MeshAxisName.CP.value}": Shard(0),
+                MeshAxisName.TP.value: Shard(0),
             },
             compute_dtype=torch.bfloat16,
         ),
@@ -348,16 +352,7 @@ class _KimiK3TrainerConfig(Trainer.Config):
             self.optim.optimizer,
             parallelism=self.parallelism,
         )
-        # TODO(#3353): Support TP-produced _StridedShard layouts in DistMuon.
-        uses_dist_muon = any(
-            isinstance(config, DistMuon.Config)
-            for config in self.optim.optimizer.optimizers
+        self.optim.optimizer = _align_dist_muon_dense_fsdp_compute_layouts(
+            self.optim.optimizer,
+            parallelism=self.parallelism,
         )
-        if uses_dist_muon and self.parallelism.tensor_parallel_degree > 1:
-            # Fail during config parsing, before TP/FSDP creates _StridedShard
-            # storage. Recipes that need TP replace the optimizer.
-            raise ValueError(
-                "Kimi K3 DistMuon currently requires tensor_parallel_degree=1: "
-                "tensor parallelism can produce unsupported _StridedShard "
-                "parameter layouts."
-            )
