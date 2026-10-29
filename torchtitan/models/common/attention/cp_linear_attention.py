@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch.distributed as dist
+from torch.utils import _pytree as pytree
 
 from torchtitan.distributed.context_parallel import get_token_fragments
 from torchtitan.distributed.parallelism_context import MeshAxisName
@@ -95,6 +96,19 @@ class ContextParallelLinearAttentionMetadata(LinearAttentionMetadata):
                 spmd.assert_type(value, self._ROUTING_SPMD_TYPE)
 
 
+# CP metadata crosses CUDA-graph boundaries after the input sharding step.
+# Expose every routing tensor so replay copies current values instead of
+# treating either dataclass as an immutable non-tensor input. Guard the
+# registration because test reloads can execute this module more than once.
+if (
+    not is_missing_kernel(ContextParallelRouting)
+    and ContextParallelRouting not in pytree.SUPPORTED_NODES
+):
+    pytree.register_dataclass(ContextParallelRouting)
+if ContextParallelLinearAttentionMetadata not in pytree.SUPPORTED_NODES:
+    pytree.register_dataclass(ContextParallelLinearAttentionMetadata)
+
+
 def prepare_cp_linear_attention_metadata(
     attention_metadata: LinearAttentionMetadata,
     *,
@@ -123,15 +137,23 @@ def prepare_cp_linear_attention_metadata(
             f"{family} metadata preparation requires an active multi-rank CP "
             "mesh axis."
         )
+    fragments = get_token_fragments(
+        cu_seqlens_global[-1],
+        cp_size=group.size(),
+        permutation=permutation,
+    )
+    # Local document cuts vary even when the global offsets are padded.
+    # Each additional fragment can split one document into another local
+    # subsequence. Preserve that capacity at the CUDA-graph input boundary.
+    max_subsequences = (
+        len(cu_seqlens_global) - 1 + max(len(owned) for owned in fragments) - 1
+    )
     routing = ContextParallelRouting.from_fragments(
         cu_seqlens_global=cu_seqlens_global,
-        fragments=get_token_fragments(
-            cu_seqlens_global[-1],
-            cp_size=group.size(),
-            permutation=permutation,
-        ),
+        fragments=fragments,
         cp_rank=dist.get_rank(group),
         device=device,
+        max_subsequences=max_subsequences,
         conv_history=attention_metadata.num_conv_history_tokens,
     )
     return ContextParallelLinearAttentionMetadata(
