@@ -6,6 +6,7 @@
 
 import dataclasses
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -24,8 +25,141 @@ from torchtitan.distributed.pipeline_parallel import (
     _get_pp_rank_to_stage_indices_mapping,
     _static_stage_metadata,
     _unsupported_static_split,
+    TorchTitanPipelineStage,
 )
 from torchtitan_recipes.tests.models.llama3 import build_model_config
+
+
+def test_pipeline_stage_can_release_cache_before_gradient_reduction():
+    """The opt-in cache release runs once at the reduction boundary."""
+    stage = TorchTitanPipelineStage.__new__(TorchTitanPipelineStage)
+    stage.empty_cache_before_gradient_reduction = True
+    stage.fsdp_reduce_scatter_on_current_stream = False
+    stage.device = torch.device("cuda")
+    stage.submod = Mock()
+    stage._has_backward = True
+    events = []
+    device_module = Mock()
+    device_module.empty_cache.side_effect = lambda: events.append("empty_cache")
+
+    with (
+        patch.object(pipeline_parallel, "FSDPModule", Mock, create=True),
+        patch("torch.get_device_module", return_value=device_module),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "perform_reduce_grad",
+            side_effect=lambda _: events.append("reduce"),
+        ),
+    ):
+        stage.perform_reduce_grad(1)
+
+    assert events == ["empty_cache", "reduce"]
+
+
+def test_pipeline_stage_releases_cache_only_before_first_backward():
+    """The startup cache release is bounded to one call per local stage."""
+    stage = TorchTitanPipelineStage.__new__(TorchTitanPipelineStage)
+    stage.empty_cache_before_first_backward = True
+    stage._emptied_cache_before_first_backward = False
+    stage.device = torch.device("cuda")
+    events = []
+    device_module = Mock()
+    device_module.empty_cache.side_effect = lambda: events.append("empty_cache")
+
+    with (
+        patch("torch.get_device_module", return_value=device_module),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "backward_one_chunk",
+            side_effect=lambda chunk, **kwargs: events.append(f"backward_{chunk}"),
+        ) as backward,
+    ):
+        stage.backward_one_chunk(0)
+        stage.backward_one_chunk(1, last_backward=True)
+
+    assert events == ["empty_cache", "backward_0", "backward_1"]
+    assert [
+        (backward_call.args, backward_call.kwargs)
+        for backward_call in backward.call_args_list
+    ] == [
+        ((0,), {"loss": None, "full_backward": True, "last_backward": False}),
+        ((1,), {"loss": None, "full_backward": True, "last_backward": True}),
+    ]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_pipeline_stage_configures_opt_in_backward_resharding(enabled):
+    """The default retains parameters; the opt-in invokes the PyTorch API."""
+    with (
+        patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "set_reshard_after_backward",
+            create=True,
+        ) as configure,
+    ):
+        stage = TorchTitanPipelineStage(fsdp_reshard_after_backward=enabled)
+    assert stage.fsdp_reshard_after_backward is enabled
+    if enabled:
+        configure.assert_called_once_with(True)
+    else:
+        configure.assert_not_called()
+
+
+def test_pipeline_stage_rejects_missing_backward_resharding_api():
+    """An older PyTorch cannot silently ignore the requested memory policy."""
+    with (
+        patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "set_reshard_after_backward",
+            None,
+            create=True,
+        ),
+    ):
+        TorchTitanPipelineStage()
+        with pytest.raises(RuntimeError, match="set_reshard_after_backward API"):
+            TorchTitanPipelineStage(fsdp_reshard_after_backward=True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_pipeline_stage_configures_current_stream_reduction(enabled):
+    """Only the opt-in configures FSDP, before schedule finalization."""
+    with patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None):
+        stage = TorchTitanPipelineStage(fsdp_reduce_scatter_on_current_stream=enabled)
+    stage.submod = Mock()
+    stage._has_backward = True
+    events = []
+    stage.submod.set_reduce_scatter_on_current_stream.side_effect = (
+        lambda _: events.append("configure")
+    )
+    with (
+        patch.object(pipeline_parallel, "FSDPModule", Mock),
+        patch.object(
+            pipeline_parallel.PipelineStage,
+            "perform_reduce_grad",
+            side_effect=lambda _: events.append("reduce"),
+        ),
+    ):
+        stage.perform_reduce_grad(1)
+    assert events == (["configure", "reduce"] if enabled else ["reduce"])
+    if enabled:
+        stage.submod.set_reduce_scatter_on_current_stream.assert_called_once_with(True)
+    else:
+        stage.submod.set_reduce_scatter_on_current_stream.assert_not_called()
+
+
+def test_pipeline_stage_rejects_missing_current_stream_reduction_api():
+    """An older PyTorch cannot silently ignore the requested stream policy."""
+    with patch.object(pipeline_parallel.PipelineStage, "__init__", return_value=None):
+        stage = TorchTitanPipelineStage(fsdp_reduce_scatter_on_current_stream=True)
+    stage.submod = Mock(set_reduce_scatter_on_current_stream=None)
+    stage._has_backward = True
+    with patch.object(pipeline_parallel, "FSDPModule", Mock):
+        with pytest.raises(
+            RuntimeError, match="set_reduce_scatter_on_current_stream API"
+        ):
+            stage.perform_reduce_grad(1)
 
 
 def test_pipeline_with_first_last_stage_modules_prepends_present_modules(monkeypatch):

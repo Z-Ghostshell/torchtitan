@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.distributed._mesh_layout import _MeshLayout
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
@@ -45,7 +46,85 @@ __all__ = [
     "prepare_pipeline_schedule_for_cuda_graph",
     "pipeline_llm",
     "pipeline_with_first_last_stage_modules",
+    "TorchTitanPipelineStage",
 ]
+
+
+class TorchTitanPipelineStage(PipelineStage):
+    """Pipeline stage with TorchTitan's opt-in memory lifecycle policies."""
+
+    def __init__(
+        self,
+        *args: Any,
+        empty_cache_before_gradient_reduction: bool = False,
+        empty_cache_before_first_backward: bool = False,
+        fsdp_reshard_after_backward: bool = False,
+        fsdp_reduce_scatter_on_current_stream: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.empty_cache_before_gradient_reduction = (
+            empty_cache_before_gradient_reduction
+        )
+        self.empty_cache_before_first_backward = empty_cache_before_first_backward
+        self._emptied_cache_before_first_backward = False
+        self.fsdp_reshard_after_backward = fsdp_reshard_after_backward
+        self.fsdp_reduce_scatter_on_current_stream = (
+            fsdp_reduce_scatter_on_current_stream
+        )
+        if fsdp_reshard_after_backward:
+            configure_resharding = getattr(self, "set_reshard_after_backward", None)
+            if configure_resharding is None:
+                raise RuntimeError(
+                    "Pipeline backward resharding requires PyTorch's "
+                    "PipelineStage.set_reshard_after_backward API"
+                )
+            configure_resharding(True)
+
+    def backward_one_chunk(
+        self,
+        bwd_chunk_id: int,
+        loss: torch.Tensor | None = None,
+        full_backward: bool = True,
+        last_backward: bool = False,
+    ) -> None:
+        """Run backward after the optional one-time allocator cache release."""
+        if (
+            self.empty_cache_before_first_backward
+            and not self._emptied_cache_before_first_backward
+        ):
+            torch.get_device_module(self.device).empty_cache()
+            self._emptied_cache_before_first_backward = True
+        return super().backward_one_chunk(
+            bwd_chunk_id,
+            loss=loss,
+            full_backward=full_backward,
+            last_backward=last_backward,
+        )
+
+    def perform_reduce_grad(self, grad_scale_factor: int) -> None:
+        """Finalize gradients under the configured stream and cache policies."""
+        if (
+            self.fsdp_reduce_scatter_on_current_stream
+            and isinstance(self.submod, FSDPModule)
+            and self.has_backward
+        ):
+            configure_stream = getattr(
+                self.submod, "set_reduce_scatter_on_current_stream", None
+            )
+            if configure_stream is None:
+                raise RuntimeError(
+                    "Current-stream pipeline reduction requires PyTorch's "
+                    "FSDPModule.set_reduce_scatter_on_current_stream API"
+                )
+            configure_stream(True)
+        if (
+            self.empty_cache_before_gradient_reduction
+            and isinstance(self.submod, FSDPModule)
+            and self.has_backward
+        ):
+            torch.get_device_module(self.device).empty_cache()
+        super().perform_reduce_grad(grad_scale_factor)
 
 
 def _build_get_mesh_callback(
@@ -133,6 +212,18 @@ def pipeline_llm(
         module_names_per_stage,
         get_mesh=get_mesh_cb,
         stage_io=stage_io,
+        empty_cache_before_gradient_reduction=(
+            parallelism.pipeline_parallel_empty_cache_before_gradient_reduction
+        ),
+        empty_cache_before_first_backward=(
+            parallelism.pipeline_parallel_empty_cache_before_first_backward
+        ),
+        fsdp_reshard_after_backward=(
+            parallelism.pipeline_parallel_reshard_after_backward
+        ),
+        fsdp_reduce_scatter_on_current_stream=(
+            parallelism.pipeline_parallel_reduce_scatter_on_current_stream
+        ),
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -841,6 +932,10 @@ def _pipeline_module_split(
     module_names_per_stage: list[list[str]],
     get_mesh: Callable | None = None,
     stage_io: _DecoderStageIO | None = None,
+    empty_cache_before_gradient_reduction: bool = False,
+    empty_cache_before_first_backward: bool = False,
+    fsdp_reshard_after_backward: bool = False,
+    fsdp_reduce_scatter_on_current_stream: bool = False,
 ) -> tuple[list[PipelineStage], list[BaseModel]]:
     """Create pipeline stages based on specified module names for each stage.
 
@@ -867,6 +962,10 @@ def _pipeline_module_split(
         get_mesh: Callback used to reconstruct DTensor inputs after PP receives.
         stage_io: Static tensors describing decoder stage boundaries. Fake PP
             requires these because it cannot exchange metadata dynamically.
+        fsdp_reshard_after_backward: Release parameters after each full
+            microbatch backward without enabling per-microbatch reductions.
+        fsdp_reduce_scatter_on_current_stream: Run deferred reductions on the
+            current stream to enable same-stream CUDA-graph buffer reuse.
 
     Returns:
         Tuple of (stages, models) where stages are PipelineStage objects and models are the
@@ -890,13 +989,21 @@ def _pipeline_module_split(
     for stage_idx in pp_rank_to_stage_indices:
         module_names = module_names_per_stage[stage_idx]
         model_chunk = _split_module(whole_model, module_names)
-        stage = PipelineStage(
+        stage = TorchTitanPipelineStage(
             model_chunk,
             stage_idx,
             num_stages,
             device,
             group=pp_mesh.get_group("pp"),
             get_mesh=get_mesh,
+            empty_cache_before_gradient_reduction=(
+                empty_cache_before_gradient_reduction
+            ),
+            empty_cache_before_first_backward=empty_cache_before_first_backward,
+            fsdp_reshard_after_backward=fsdp_reshard_after_backward,
+            fsdp_reduce_scatter_on_current_stream=(
+                fsdp_reduce_scatter_on_current_stream
+            ),
             **(
                 _static_stage_metadata(stage_io, stage_idx, num_stages)
                 if stage_io is not None

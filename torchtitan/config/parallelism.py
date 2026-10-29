@@ -159,6 +159,43 @@ class ParallelismConfig:
     explicit send waits. None adds no hard limit.
     """
 
+    pipeline_parallel_empty_cache_before_gradient_reduction: bool = False
+    """Release unused cached device memory before PP gradient reduction.
+
+    This runs once per local pipeline stage after its backward microbatches
+    finish, not before individual forward or backward actions. It may add a
+    device synchronization, so enable it only when allocator fragmentation
+    would otherwise prevent the reduced-gradient output allocation.
+    """
+
+    pipeline_parallel_empty_cache_before_first_backward: bool = False
+    """Release unused cached device memory before each PP stage's first backward.
+
+    This runs at most once per local stage for the process lifetime. It is
+    intended to reclaim startup and first-forward allocator fragments without
+    placing cache management on every pipeline action.
+    """
+
+    pipeline_parallel_reshard_after_backward: bool = False
+    """Reshard FSDP parameters after each pipeline microbatch backward.
+
+    Gradient reduction remains deferred until the schedule's reduction action.
+    This reduces unsharded-parameter residency at the cost of additional
+    all-gathers. Only full-backward pipeline schedules are supported, and
+    PyTorch must provide ``PipelineStage.set_reshard_after_backward``.
+    The default preserves the pipeline's existing parameter-retention policy.
+    """
+
+    pipeline_parallel_reduce_scatter_on_current_stream: bool = False
+    """Reduce deferred pipeline gradients on the caller's current stream.
+
+    This can reuse backward's cached CUDA-graph storage for reduced gradients,
+    at the cost of packing/reduction overlap during schedule finalization.
+    Dtypes, process groups, and gradient accumulation are unchanged. The
+    default keeps FSDP's communication stream. PyTorch must provide
+    ``FSDPModule.set_reduce_scatter_on_current_stream``.
+    """
+
     pp_max_unsharded_active_stages: int | None = None
     """Maximum local pipeline stages whose parameters may remain unsharded.
 

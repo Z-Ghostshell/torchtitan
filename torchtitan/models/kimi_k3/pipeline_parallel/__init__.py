@@ -42,6 +42,26 @@ def _as_attn_res_stage(stage: _PipelineStageBase) -> AttnResPipelineStage:
         group=stage.group,
         dw_builder=stage.dw_builder,
         get_mesh=stage._mesh_cache._get_mesh_cb,
+        empty_cache_before_gradient_reduction=getattr(
+            stage,
+            "empty_cache_before_gradient_reduction",
+            False,
+        ),
+        empty_cache_before_first_backward=getattr(
+            stage,
+            "empty_cache_before_first_backward",
+            False,
+        ),
+        fsdp_reshard_after_backward=getattr(
+            stage,
+            "fsdp_reshard_after_backward",
+            False,
+        ),
+        fsdp_reduce_scatter_on_current_stream=getattr(
+            stage,
+            "fsdp_reduce_scatter_on_current_stream",
+            False,
+        ),
     )
     # The schedule wrote its stage-to-rank map onto the stage it was handed.
     rebuilt.stage_index_to_group_rank = stage.stage_index_to_group_rank
