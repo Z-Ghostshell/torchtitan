@@ -5,11 +5,72 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from torchtitan.distributed.flex_shard._optimizer_reshard_runtime import _batched_copy_
+from torchtitan.distributed.flex_shard._optimizer_reshard_runtime import (
+    _batched_copy_,
+    _BucketedRedistributionRuntime,
+    _BufferSlot,
+    _initialize_all_to_all_communicators,
+    _ReservedBuffers,
+)
+
+
+class TestCommunicatorInitialization(unittest.TestCase):
+    def test_initializes_each_remote_cuda_process_group_once(self):
+        first_group = object()
+        second_group = object()
+        schedules = (
+            SimpleNamespace(
+                process_group=first_group,
+                participants=(0, 1, 2),
+                has_remote_transfers=True,
+            ),
+            SimpleNamespace(
+                process_group=first_group,
+                participants=(0, 1, 2),
+                has_remote_transfers=True,
+            ),
+            SimpleNamespace(
+                process_group=second_group,
+                participants=(0,),
+                has_remote_transfers=False,
+            ),
+        )
+        input = object()
+        output = object()
+        with (
+            patch.object(torch, "empty", return_value=input) as empty,
+            patch.object(torch, "empty_like", return_value=output),
+            patch.object(torch.distributed, "all_to_all_single") as all_to_all_single,
+        ):
+            _initialize_all_to_all_communicators(
+                schedules,  # pyrefly: ignore [bad-argument-type]
+                torch.device("cuda"),
+            )
+
+        empty.assert_called_once_with(3, dtype=torch.uint8, device=torch.device("cuda"))
+        all_to_all_single.assert_called_once_with(
+            output,
+            input,
+            group=first_group,
+        )
+
+    def test_skips_non_cuda_devices(self):
+        schedule = SimpleNamespace(
+            process_group=object(),
+            participants=(0, 1),
+            has_remote_transfers=True,
+        )
+        with patch.object(torch.distributed, "all_to_all_single") as all_to_all_single:
+            _initialize_all_to_all_communicators(
+                (schedule,),  # pyrefly: ignore [bad-argument-type]
+                torch.device("cpu"),
+            )
+        all_to_all_single.assert_not_called()
 
 
 class TestBatchedCopy(unittest.TestCase):
@@ -73,6 +134,32 @@ class TestBatchedCopy(unittest.TestCase):
                 (torch.empty(3), torch.empty(4)),
                 (torch.empty(9), torch.empty(4)),
             )
+
+
+class TestRuntimeBufferLifetime(unittest.TestCase):
+    def test_release_buffers_preserves_context_and_clears_tensor_references(self):
+        device = torch.device("cpu")
+        key = (device, torch.float32)
+        runtime = _BucketedRedistributionRuntime(device)
+        runtime._local_slot.buffers[key] = _ReservedBuffers(
+            compute_scratch=torch.empty(4)
+        )
+        remote_buffers = _BufferSlot(
+            buffers={
+                key: _ReservedBuffers(
+                    storage_exchange=torch.empty(8),
+                    compute_exchange=torch.empty(8),
+                )
+            }
+        )
+        context = SimpleNamespace(slots=(SimpleNamespace(buffers=remote_buffers),))
+        runtime._context = context  # pyrefly: ignore [bad-assignment]
+
+        runtime.release_buffers()
+
+        self.assertEqual(runtime._local_slot.buffers, {})
+        self.assertEqual(remote_buffers.buffers, {})
+        self.assertIs(runtime._context, context)
 
 
 if __name__ == "__main__":

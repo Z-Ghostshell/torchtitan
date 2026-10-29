@@ -16,7 +16,9 @@ from functools import partial
 from typing import Any, cast, Literal, NoReturn, overload
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.optim import Optimizer
@@ -106,7 +108,9 @@ def _initialize_dist_muon(
     local parameter FQN must have one entry in ``compute_sharding_by_fqn``;
     extra compute-sharding entries for parameters on other pipeline stages are
     ignored. Parameter groups, compute layouts, and bucket configuration are
-    frozen because optimizer state and collectives depend on them.
+    frozen because optimizer state and collectives depend on them. A process
+    group resolver may replace each storage-mesh communicator with one that has
+    identical participants and rank order.
     """
     _validate_compute_sharding_configuration(compute_sharding_by_fqn)
 
@@ -159,6 +163,10 @@ class DistMuon(Optimizer):
     time, but bitwise equality across the two kernel schedules is not part of
     the contract.
 
+    ``get_redistribution_process_group`` may return a dedicated communicator
+    for each storage mesh, but its participants and rank order must match the
+    storage mesh's existing process group.
+
     ``ns_device`` selects where Newton-Schulz runs. ``None`` keeps the storage
     device, where each parameter's local shard lives (the host under FSDP2 CPU
     offload). ``"accelerator"`` copies each compute view to the current
@@ -173,6 +181,10 @@ class DistMuon(Optimizer):
     _direction_row_scale_by_fqn: dict[str, Tensor]
     _redistribution_runtime: _BucketedRedistributionRuntime[_ParameterComputeLayout]
     _param_groups_frozen: bool
+    _persistent_redistribution_buffers: bool
+    _get_redistribution_process_group: (
+        Callable[[DeviceMesh], dist.ProcessGroup] | None
+    )
 
     def __init__(
         self,
@@ -189,6 +201,9 @@ class DistMuon(Optimizer):
         ns_steps: int = 5,
         adjust_lr_fn: str | None = None,
         ns_device: Literal["accelerator"] | None = None,
+        persistent_redistribution_buffers: bool = True,
+        get_redistribution_process_group: Callable[[DeviceMesh], dist.ProcessGroup]
+        | None = None,
     ) -> None:
         self._ns_device = self._resolve_ns_device(ns_device)
         defaults = {
@@ -203,6 +218,8 @@ class DistMuon(Optimizer):
         }
         self._first_step_validated = False
         self._param_groups_frozen = False
+        self._persistent_redistribution_buffers = persistent_redistribution_buffers
+        self._get_redistribution_process_group = get_redistribution_process_group
         super().__init__(_normalize_param_groups(params), defaults)
         self._validate_groups()
         self._param_groups_frozen = True
@@ -211,6 +228,8 @@ class DistMuon(Optimizer):
             compute_sharding_by_fqn=compute_sharding_by_fqn,
             bucket_configs=bucket_configs,
         )
+        if not self._persistent_redistribution_buffers:
+            self._redistribution_runtime.release_buffers()
 
     @staticmethod
     def _resolve_ns_device(ns_device: str | None) -> torch.device | None:
@@ -242,13 +261,22 @@ class DistMuon(Optimizer):
                 loss = closure()
 
         self._preflight_step()
-        self._redistribution_runtime.run(
-            self._bucket_plans,
-            local_tensor_spec=self._local_tensor_spec,
-            prepare=self._prepare_local,
-            compute=self._compute_update,
-            finalize=self._apply_update,
-        )
+        if not self._persistent_redistribution_buffers:
+            self._redistribution_runtime.reserve_buffers(
+                self._bucket_plans,
+                local_tensor_spec=self._local_tensor_spec,
+            )
+        try:
+            self._redistribution_runtime.run(
+                self._bucket_plans,
+                local_tensor_spec=self._local_tensor_spec,
+                prepare=self._prepare_local,
+                compute=self._compute_update,
+                finalize=self._apply_update,
+            )
+        finally:
+            if not self._persistent_redistribution_buffers:
+                self._redistribution_runtime.release_buffers()
         return loss
 
     def add_param_group(self, param_group: dict[str, Any]) -> None:
@@ -361,6 +389,7 @@ class DistMuon(Optimizer):
                 ns_steps_by_group=ns_steps_by_group,
             ),
             get_compute_dtype=lambda item: item.compute_dtype,
+            get_redistribution_process_group=(self._get_redistribution_process_group),
         )
 
         def build_views(
@@ -2026,16 +2055,22 @@ def _zeropower_via_newtonschulz(
         for _ in range(ns_steps):
             gram = result @ result.T
             gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
+            del gram
             result = torch.addmm(result, gram_update, result, beta=a)
+            del gram_update
     else:
         original_shape = result.shape
         matrices = result.reshape(-1, *original_shape[-2:])
+        # The loop replaces matrices; do not retain the initial BF16 storage.
+        del result
         # Batched kernels and independent matrix calls can use different BF16
         # reduction orders.
         for _ in range(ns_steps):
             gram = matrices @ matrices.transpose(-2, -1)
             gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+            del gram
             matrices = torch.baddbmm(matrices, gram_update, matrices, beta=a)
+            del gram_update
         result = matrices.reshape(original_shape)
 
     return result.transpose(-2, -1) if transposed else result
@@ -2052,6 +2087,8 @@ def _after_load_state_dict(optimizer: Optimizer) -> None:
         muon._bucket_plans,
         local_tensor_spec=muon._local_tensor_spec,
     )
+    if not muon._persistent_redistribution_buffers:
+        muon._redistribution_runtime.release_buffers()
     # init_optim_state may have validated placeholder state before the load.
     muon._first_step_validated = False
 
