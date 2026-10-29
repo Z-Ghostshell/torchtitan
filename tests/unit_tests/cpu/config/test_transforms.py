@@ -25,7 +25,9 @@ from torchtitan.config.transform import (
     transform_model_config_,
     TransformRelations,
 )
+from torchtitan.config.transform.dist_moe import DistMoeTransform
 from torchtitan.models.base.module import Module
+from torchtitan.models.common.activation import ClampedSwiGLU
 from torchtitan.models.common.attention import (
     Attention,
     FlexInnerAttention,
@@ -46,6 +48,7 @@ from torchtitan.models.common.attention.cp_mla import (
     AllGatherKVMLAFlexAttention,
     UlyssesMLAAttention,
 )
+from torchtitan.models.common.config_utils import make_routed_experts_config
 from torchtitan.models.common.decoder_sharding import mla_kv_projection_sharding_config
 from torchtitan.models.common.linear import (
     ColumnParallelLinear,
@@ -62,6 +65,23 @@ from torchtitan.models.common.moe.token_dispatcher import (
     DeepEPTokenDispatcher,
 )
 from torchtitan.models.common.vision_encoder import InvariantRowParallelLinear
+
+
+class TestDistMoeActivationPolicy(unittest.TestCase):
+    def test_rejects_unsupported_clamped_swiglu_offset(self):
+        for offset in (0.0, 2.0):
+            with self.subTest(offset=offset):
+                source = make_routed_experts_config(
+                    dim=32,
+                    hidden_dim=64,
+                    num_experts=4,
+                    top_k=2,
+                    param_init={},
+                    enable_ep=False,
+                )
+                source.activation_fn = ClampedSwiGLU.Config(swiglu_offset=offset)
+                with self.assertRaisesRegex(ValueError, "requires swiglu_offset=1.0"):
+                    DistMoeTransform().transform(source)
 
 
 def _llama3_cp_ready():

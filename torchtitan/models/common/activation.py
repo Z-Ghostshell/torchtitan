@@ -15,6 +15,8 @@ import torch.nn.functional as F
 from torchtitan.config.function import Function
 from torchtitan.distributed.local_compile import local_compile
 
+# X: leading activation dimensions, F: feed-forward hidden dimension.
+
 
 class BinaryActivationFn(Function[torch.Tensor], ABC):
     """Base class for gated activations such as SwiGLU, applied to ``w13``'s output.
@@ -176,36 +178,18 @@ class SwiGLU(BinaryActivationFn):
         return F.silu(gate) * up
 
 
-class LimitedSwiGLU(BinaryActivationFn):
-    """SwiGLU that clamps gate above and up on both sides (DeepSeek-V4 ``swiglu_limit``)."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(BinaryActivationFn.Config):
-        swiglu_limit: float
-
-        def __post_init__(self) -> None:
-            if not math.isfinite(self.swiglu_limit) or self.swiglu_limit <= 0:
-                raise ValueError(
-                    "swiglu_limit must be finite and positive, got "
-                    f"{self.swiglu_limit}"
-                )
-
-    def __init__(self, config: Config) -> None:
-        self.limit = config.swiglu_limit
-
-    def _activation_fn(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-        gate = gate.clamp(max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-        return F.silu(gate) * up
-
-
 class ClampedSwiGLU(BinaryActivationFn):
-    """Clamped SwiGLU with configurable sigmoid scale and input bound."""
+    """Clamped ``gate * sigmoid(alpha * gate) * (up + offset)``.
+
+    Clamp gate above and up on both sides before applying the activation.
+    Defaults match GPT-OSS; alpha=1 and offset=0 give DeepSeek V4's activation.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BinaryActivationFn.Config):
         swiglu_alpha: float = 1.702
         swiglu_limit: float = 7.0
+        swiglu_offset: float = 1.0
 
         def __post_init__(self) -> None:
             if not math.isfinite(self.swiglu_alpha) or self.swiglu_alpha <= 0:
@@ -218,16 +202,28 @@ class ClampedSwiGLU(BinaryActivationFn):
                     "swiglu_limit must be finite and positive, got "
                     f"{self.swiglu_limit}"
                 )
+            if not math.isfinite(self.swiglu_offset):
+                raise ValueError(
+                    f"swiglu_offset must be finite, got {self.swiglu_offset}"
+                )
 
     def __init__(self, config: Config) -> None:
         self.alpha = config.swiglu_alpha
         self.limit = config.swiglu_limit
+        self.offset = config.swiglu_offset
 
-    def _activation_fn(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-        gate = gate.clamp(max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-        silu = gate * torch.sigmoid(self.alpha * gate)
-        return torch.addcmul(silu, silu, up)
+    def _activation_fn(
+        self, gate_XF: torch.Tensor, up_XF: torch.Tensor
+    ) -> torch.Tensor:
+        gate_XF = gate_XF.clamp(max=self.limit)
+        up_XF = up_XF.clamp(min=-self.limit, max=self.limit)
+        # Keep the existing SiLU and addcmul paths to preserve model numerics.
+        if self.alpha == 1.0 and self.offset == 0.0:
+            return F.silu(gate_XF) * up_XF
+        silu_XF = gate_XF * torch.sigmoid(self.alpha * gate_XF)
+        if self.offset == 1.0:
+            return torch.addcmul(silu_XF, silu_XF, up_XF)
+        return silu_XF * (up_XF + self.offset)
 
 
 # TODO: move to models/kimi_k3, its only user.

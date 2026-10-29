@@ -7,12 +7,38 @@
 import unittest
 from unittest.mock import patch
 
+import pytest
 import spmd_types as spmd
 import torch
 
-from torchtitan.models.common.activation import Sigmoid
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.common.activation import ClampedSwiGLU, Sigmoid, SwiGLU
 from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
+from torchtitan.models.common.moe import MoE
+from torchtitan.models.deepseek_v4 import build_model_config
 from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
+
+
+@pytest.mark.parametrize(
+    "flavor", ["debugmodel", "deepseek_v4_flash", "deepseek_v4_pro"]
+)
+def test_deepseek_v4_flavors_configure_routed_shared_and_mtp_activations(flavor):
+    config = build_model_config(flavor, parallelism=ParallelismConfig(), n_mtp_layers=1)
+    assert config.mtp_layers
+    moe_configs = [moe for _, moe, _, _ in config.traverse(MoE.Config)]
+    assert moe_configs
+    for moe in moe_configs:
+        activations = [moe.routed_experts.activation_fn]
+        if moe.shared_experts is not None:
+            activations.append(moe.shared_experts.activation_fn)
+        for activation in activations:
+            if flavor == "debugmodel":
+                assert isinstance(activation, SwiGLU.Config)
+            else:
+                assert isinstance(activation, ClampedSwiGLU.Config)
+                assert activation.swiglu_alpha == 1.0
+                assert activation.swiglu_limit == 10.0
+                assert activation.swiglu_offset == 0.0
 
 
 class TestDeepSeekV4Router(unittest.TestCase):

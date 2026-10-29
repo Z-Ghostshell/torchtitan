@@ -17,11 +17,12 @@ def _reference_swiglu(gate, up, limit: float = 7.0):
     return torch.addcmul(silu, silu, up)
 
 
-def test_swiglu_matches_reference_formula_and_gradients():
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16])
+def test_swiglu_matches_reference_formula_and_gradients(dtype):
     """The configured GPT-OSS activation matches its forward and backward formula."""
     torch.manual_seed(0)
-    gate = torch.randn(4, 4, dtype=torch.float64, requires_grad=True)
-    up = torch.randn(4, 4, dtype=torch.float64, requires_grad=True)
+    gate = torch.randn(4, 4, dtype=dtype, requires_grad=True)
+    up = torch.randn(4, 4, dtype=dtype, requires_grad=True)
     gate_ref = gate.detach().clone().requires_grad_()
     up_ref = up.detach().clone().requires_grad_()
 

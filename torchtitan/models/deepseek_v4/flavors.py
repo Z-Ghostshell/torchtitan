@@ -20,12 +20,12 @@ from torchtitan.config.transform import (
     validate_converter_compatibility,
 )
 from torchtitan.models.common import (
+    ClampedSwiGLU,
     ComplexRoPE,
     DenseFeedForward,
     Embedding,
     FeedForward,
     HiMidLoLinear,
-    LimitedSwiGLU,
     Linear,
     MoE,
     RMSNorm,
@@ -427,10 +427,12 @@ def _make_v4_moe_config(
         else None
     )
     if swiglu_limit is not None:
-        routed_experts.activation_fn = LimitedSwiGLU.Config(swiglu_limit=swiglu_limit)
+        routed_experts.activation_fn = ClampedSwiGLU.Config(
+            swiglu_alpha=1.0, swiglu_limit=swiglu_limit, swiglu_offset=0.0
+        )
         if shared_experts is not None:
-            shared_experts.activation_fn = LimitedSwiGLU.Config(
-                swiglu_limit=swiglu_limit
+            shared_experts.activation_fn = ClampedSwiGLU.Config(
+                swiglu_alpha=1.0, swiglu_limit=swiglu_limit, swiglu_offset=0.0
             )
 
     return MoE.Config(

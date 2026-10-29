@@ -8,7 +8,10 @@ import unittest
 
 import torch
 
-from torchtitan.models.common.activation import SwiGLU
+from torchtitan.config import apply_overrides, OverrideConfig
+from torchtitan.models.common.activation import ClampedSwiGLU, SwiGLU
+from torchtitan.models.common.feed_forward import DenseFeedForward
+from torchtitan.models.common.linear import Linear
 from torchtitan_recipes.overrides.fused_swiglu import (
     fused_swiglu,
     FusedSwiGLU,
@@ -25,6 +28,30 @@ class TestFusedSwiGLUOverride(unittest.TestCase):
         replacement = fused_swiglu(cfg)
 
         self.assertIsInstance(replacement, FusedSwiGLU.Config)
+
+    def test_clamped_swiglu_is_not_replaced_by_plain_kernel(self):
+        for activation in (
+            ClampedSwiGLU.Config(),
+            ClampedSwiGLU.Config(
+                swiglu_alpha=1.0, swiglu_limit=10.0, swiglu_offset=0.0
+            ),
+        ):
+            with self.subTest(offset=activation.swiglu_offset):
+                config = DenseFeedForward.Config(
+                    w13=Linear.Config(in_features=4, out_features=8, num_linears=2),
+                    w2=Linear.Config(in_features=8, out_features=4),
+                    activation_fn=activation,
+                )
+                replacements = apply_overrides(
+                    OverrideConfig(
+                        imports=[
+                            "torchtitan_recipes.overrides.fused_swiglu.fused_swiglu"
+                        ]
+                    ),
+                    config,
+                )
+                self.assertEqual(replacements, [])
+                self.assertIs(config.activation_fn, activation)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
